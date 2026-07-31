@@ -1,0 +1,199 @@
+name: VPN Meridian
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      requests:
+        description: "Number of VPN Gate API requests to run"
+        required: false
+        default: "100"
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vpn-meridian-data-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Use Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24'
+          cache-dependency-path: go.sum
+
+      - name: Build
+        run: go build -o /dev/null ./cmd/vpn-meridian/ && go build -o /dev/null ./cmd/testcheck/
+
+      - name: Vet
+        run: go vet ./...
+
+  collect:
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name != 'pull_request'
+    env:
+      OUTPUT_DIR: public
+      STATE_PATH: public/state/servers.json
+      ACTIVE_MISS_LIMIT: "12"
+      PRUNE_MISS_LIMIT: "48"
+      TOTAL_REQUESTS: ${{ github.event_name == 'schedule' && '200' || github.event.inputs.requests || '100' }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Use Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24'
+          cache-dependency-path: go.sum
+
+      - name: Build scraper
+        run: go build -o vpn-meridian ./cmd/vpn-meridian/
+
+      - name: Restore previous incremental state
+        run: |
+          mkdir -p public/state public/json
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages:refs/remotes/origin/gh-pages --depth=1
+            git show origin/gh-pages:state/servers.json > public/state/servers.json || true
+            git show origin/gh-pages:json/data.json > public/json/data.json || true
+          fi
+
+      - name: Collect VPN Gate data
+        run: ./vpn-meridian
+
+      - name: Download MaxMind databases
+        run: |
+          set -euo pipefail
+          maxmind_ref="$(git ls-remote https://github.com/6Kmfi6HP/maxmind.git refs/heads/main | awk '{print $1}')"
+          if ! printf '%s' "$maxmind_ref" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "Unable to resolve 6Kmfi6HP/maxmind main commit" >&2
+            exit 1
+          fi
+          base_url="https://raw.githubusercontent.com/6Kmfi6HP/maxmind/$maxmind_ref"
+          mkdir -p maxmind
+
+          download_database() {
+            edition="$1"
+            curl -fsSL "$base_url/$edition.tar.gz.sha256" -o "maxmind/$edition.tar.gz.sha256"
+            expected_hash="$(awk '{print $1}' "maxmind/$edition.tar.gz.sha256")"
+            expected_archive="$(awk '{print $2}' "maxmind/$edition.tar.gz.sha256")"
+            if ! printf '%s' "$expected_hash" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "Invalid SHA256 metadata for $edition" >&2
+              exit 1
+            fi
+            if [ -z "$expected_archive" ]; then
+              echo "Missing archive filename metadata for $edition" >&2
+              exit 1
+            fi
+            echo "$edition upstream archive: $expected_archive ($expected_hash)"
+            curl -fsSL "$base_url/$edition.mmdb" -o "maxmind/$edition.mmdb"
+            test -s "maxmind/$edition.mmdb"
+          }
+
+          download_database GeoLite2-Country
+          download_database GeoLite2-City
+          download_database GeoLite2-ASN
+
+      - name: Run MaxMind enrichment
+        run: |
+          go run ./cmd/vpn-meridian/ enrich \
+            --input public/json/data.json \
+            --output public/json/data.maxmind.json \
+            --mihomo-output public/mihomo_openvpn.yaml \
+            --maxmind-dir maxmind
+
+      - name: Validate generated output
+        run: |
+          test -s public/README.md
+          test -s public/index.html
+          test -s public/json/data.json
+          test -s public/json/data.maxmind.json
+          test -s public/json/changes.json
+          test -s public/state/servers.json
+          test -s public/mihomo_openvpn.yaml
+
+      - name: Upload generated output artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: vpn-meridian-generated-output
+          path: public
+          retention-days: 7
+
+  test:
+    runs-on: ubuntu-latest
+    needs: collect
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Use Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24'
+          cache-dependency-path: go.sum
+
+      - name: Build test check
+        run: go build -o testcheck ./cmd/testcheck/
+
+      - name: Download generated artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: vpn-meridian-generated-output
+          path: public
+
+      - name: Test OpenVPN servers with mihomo
+        run: |
+          ./testcheck \
+            --mihomo-input public/mihomo_openvpn.yaml \
+            --data-input public/json/data.json \
+            --tested-data public/json/data.tested.json \
+            --alive-mihomo public/mihomo_tested_openvpn.yaml \
+            --results-json public/json/test_results.json \
+            --max-alive 0 \
+            --timeout 10 \
+            --workers 40 \
+            --attempts 1 \
+            --test-url "http://gstatic.com/generate_204"
+
+      - name: Validate test output
+        run: |
+          echo "=== Test Results Summary ==="
+          jq '.statistics' public/json/test_results.json
+
+      - name: Upload tested artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: vpn-meridian-tested-output
+          path: |
+            public/json/data.tested.json
+            public/json/test_results.json
+            public/mihomo_tested_openvpn.yaml
+          retention-days: 7
+
+      - name: Publish tested results to gh-pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd public
+          touch .nojekyll
+          git init
+          git checkout -B gh-pages
+          git config user.name "mcogh"
+          git config user.email "mcogh@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git add -A
+          git commit -m "Update tested VPN data"
+          git push --force origin gh-pages
