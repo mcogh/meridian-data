@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://mcogh.github.io/meridian-data/sitemap.xml
